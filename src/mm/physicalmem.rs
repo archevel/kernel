@@ -116,12 +116,58 @@ unsafe fn detect_from_fdt() -> Result<(), ()> {
 		.find_all_nodes("/memory")
 		.map(|m| m.reg().unwrap().next().unwrap());
 
+	// On x86_64 with Linux boot params, build a list of non-RAM regions from
+	// the E820 table so we can skip them when claiming FDT memory nodes.
+	// The FDT lists all physical address ranges (including MMIO holes) as
+	// "memory" nodes without distinguishing RAM from reserved, so without
+	// this filter the allocator would identity-map and hand out addresses in
+	// reserved MMIO space (e.g. Firecracker's hole at 0xeec00000).
+	#[cfg(target_arch = "x86_64")]
+	let e820_reserved: heapless::Vec<(usize, usize), 32> = {
+		let mut v = heapless::Vec::new();
+		if let hermit_entry::boot_info::PlatformInfo::LinuxBootParams { boot_params_addr, .. } =
+			env::boot_info().platform_info
+		{
+			use hermit_entry::fc;
+			let bp = boot_params_addr.get() as usize;
+			let nentries = unsafe {
+				core::ptr::read_unaligned((bp + fc::E820_ENTRIES_OFFSET) as *const u8)
+			} as usize;
+			let table_base = bp + fc::E820_TABLE_OFFSET;
+			for i in 0..nentries {
+				let entry = table_base + i * 20;
+				let start =
+					unsafe { core::ptr::read_unaligned(entry as *const u64) } as usize;
+				let size =
+					unsafe { core::ptr::read_unaligned((entry + 8) as *const u64) } as usize;
+				let typ =
+					unsafe { core::ptr::read_unaligned((entry + 16) as *const u32) };
+				if typ != 1 && size > 0 {
+					let _ = v.push((start, start + size));
+				}
+			}
+		}
+		v
+	};
+	#[cfg(not(target_arch = "x86_64"))]
+	let e820_reserved: heapless::Vec<(usize, usize), 32> = heapless::Vec::new();
+
 	for m in all_regions {
 		let start_address = m.starting_address.expose_provenance() as u64;
 		let size = m.size.unwrap() as u64;
 		let end_address = start_address + size;
 
 		if end_address <= super::kernel_end_address().as_u64() && !env::is_uefi() {
+			continue;
+		}
+
+		// Skip FDT memory nodes that fall entirely within an E820 non-RAM region.
+		let fdt_start = start_address as usize;
+		let fdt_end = end_address as usize;
+		if e820_reserved
+			.iter()
+			.any(|&(rs, re)| rs <= fdt_start && fdt_end <= re)
+		{
 			continue;
 		}
 
