@@ -110,8 +110,55 @@ pub unsafe fn map_frame_range(frame_range: PageRange) {
 }
 
 unsafe fn detect_from_start_info() {
+	// On x86_64 with Linux boot params, build a list of non-RAM regions from
+	// the E820 table so we can skip them when claiming memory-map entries.
+	// The loader's FDT lists all physical address ranges (including MMIO
+	// holes) as "/memory" nodes without distinguishing RAM from reserved, so
+	// without this filter the allocator would identity-map and hand out
+	// addresses in reserved MMIO space (e.g. Firecracker's hole at
+	// 0xeec00000).
+	#[cfg(all(target_arch = "x86_64", feature = "hermit-entry"))]
+	#[allow(deprecated)]
+	let e820_reserved: heapless::Vec<(usize, usize), 32> = {
+		use hermit_entry::fc;
+
+		/// Reads a `T` from the identity-mapped physical address `addr`.
+		unsafe fn read<T: Copy>(addr: usize) -> T {
+			unsafe { core::ptr::with_exposed_provenance::<T>(addr).read_unaligned() }
+		}
+
+		let mut v = heapless::Vec::new();
+		if let Some(boot_params_addr) = env::boot_params_addr() {
+			let bp = boot_params_addr.get();
+			let nentries = unsafe { read::<u8>(bp + fc::E820_ENTRIES_OFFSET) } as usize;
+			let table_base = bp + fc::E820_TABLE_OFFSET;
+			for i in 0..nentries {
+				let entry = table_base + i * 20;
+				let start = unsafe { read::<u64>(entry) } as usize;
+				let size = unsafe { read::<u64>(entry + 8) } as usize;
+				let typ = unsafe { read::<u32>(entry + 16) };
+				if typ != 1 && size > 0 {
+					let _ = v.push((start, start + size));
+				}
+			}
+		}
+		v
+	};
+	#[cfg(not(all(target_arch = "x86_64", feature = "hermit-entry")))]
+	let e820_reserved: heapless::Vec<(usize, usize), 32> = heapless::Vec::new();
+
 	for memmap_entry in env::start_info().memmap() {
 		if memmap_entry.ty != MemmapType::Ram {
+			continue;
+		}
+
+		// Skip memory-map entries that fall entirely within an E820 non-RAM region.
+		let entry_start = memmap_entry.phys_addr;
+		let entry_end = entry_start + memmap_entry.len;
+		if e820_reserved
+			.iter()
+			.any(|&(rs, re)| rs <= entry_start && entry_end <= re)
+		{
 			continue;
 		}
 

@@ -22,6 +22,20 @@ pub unsafe fn set_start_info(raw_boot_info: RawBootInfo) {
 	START_INFO.set(start_info).unwrap();
 }
 
+/// Physical address of the Linux boot params ("zero page"), if the kernel was
+/// booted via the Linux boot protocol.
+#[cfg(target_arch = "x86_64")]
+pub fn boot_params_addr() -> Option<NonZero<usize>> {
+	use hermit_entry::boot_info::PlatformInfo;
+
+	match START_INFO.get()?.platform_info {
+		PlatformInfo::LinuxBootParams {
+			boot_params_addr, ..
+		} => NonZero::new(boot_params_addr.get() as usize),
+		_ => None,
+	}
+}
+
 unsafe impl FdtStartInfo for BootInfo {
 	fn fdt_addr(&self) -> Option<NonZero<usize>> {
 		let fdt_addr = self.hardware_info.device_tree?;
