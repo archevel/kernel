@@ -78,7 +78,12 @@ impl TaskNotify {
 		// is not zero, someone already wanted to wakeup a task and stored another
 		// value to the futex address. In this case, the function directly returns
 		// and doesn't block.
-		let _ = futex_wait_and_set(&self.futex, 0, timeout, Flags::RELATIVE, 0);
+		//
+		// `timeout` is an ABSOLUTE deadline in the timer-ticks domain (the only
+		// caller, `block_on`, now computes it as `get_timer_ticks() + duration`).
+		// Pass it through as absolute (no `RELATIVE` flag) so the futex layer
+		// compares it directly against `get_timer_ticks()`.
+		let _ = futex_wait_and_set(&self.futex, 0, timeout, Flags::empty(), 0);
 	}
 }
 
@@ -162,8 +167,17 @@ where
 		run();
 
 		if backoff.is_completed() {
-			let wakeup_time =
-				timeout.map(|duration| start + u64::try_from(duration.as_micros()).unwrap());
+			// The wakeup time handed to the scheduler/futex must be an ABSOLUTE
+			// deadline in the *timer-ticks* domain (`get_timer_ticks()`, micros
+			// since boot) — NOT the `now_micros()` UNIX-epoch domain used by
+			// `start` above. The scheduler programs the hardware timer and
+			// compares against `get_timer_ticks()`; a UNIX-epoch value (~30
+			// years of ticks) would push the deadline effectively to infinity,
+			// so the park would never time out and `sys_poll` would never return.
+			let wakeup_time = timeout.map(|duration| {
+				crate::arch::kernel::processor::get_timer_ticks()
+					+ u64::try_from(duration.as_micros()).unwrap()
+			});
 
 			// switch to another task
 			task_notify.wait(wakeup_time);
