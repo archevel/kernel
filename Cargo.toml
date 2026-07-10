@@ -52,6 +52,13 @@ default = [
 	"virtio-vsock",
 ]
 
+## Enables the KVM paravirtualized clock (kvmclock) as a time source.
+##
+## Required on hypervisors that expose no CMOS RTC (e.g. Firecracker): the
+## boot wall clock and monotonic time come from host-written pvclock
+## structures instead. See [`arch::x86_64::kernel::systemtime`].
+kvmclock = []
+
 #! ### Syscall Features
 
 ## Enables multiple address spaces.

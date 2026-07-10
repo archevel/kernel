@@ -173,9 +173,295 @@ impl Rtc {
 
 static BOOT_TIME: OnceCell<u64> = OnceCell::new();
 
+// --- KVM paravirtualized clock (kvmclock) --------------------------------
+//
+// Hypervisors that strip the CMOS RTC (notably Firecracker) expose time
+// through kvmclock:
+//
+// * `MSR_KVM_WALL_CLOCK_NEW` fills a guest-memory `pvclock_wall_clock` struct
+//   with the wall-clock time at kvmclock's zero point, i.e. the boot instant.
+//   KVM recomputes it on every MSR write (`host wall clock - current
+//   kvmclock`), so re-reading it also picks up host-side clock changes --
+//   most importantly the time a VM spent paused in a snapshot.
+// * `MSR_KVM_SYSTEM_TIME_NEW` registers a `pvclock_vcpu_time_info` page that
+//   the host keeps updated with an exact TSC-to-nanoseconds scaling
+//   (`tsc_to_system_mul`/`tsc_shift`) and base. This gives drift-free
+//   monotonic time (unlike our whole-MHz `CPU_FREQUENCY` calibration) that
+//   stays continuous across snapshot/restore.
+//
+// Wall time is `epoch + system_time`, with the epoch re-derived at most once
+// per second so that after a snapshot/restore the wall clock converges to the
+// host's real time within a bounded interval instead of staying behind by the
+// pause duration.
+#[cfg(feature = "kvmclock")]
+mod kvmclock {
+	use core::sync::atomic::{
+		AtomicBool, AtomicI8, AtomicU8, AtomicU32, AtomicU64, Ordering, fence,
+	};
+
+	use memory_addresses::VirtAddr;
+	use x86_64::registers::model_specific::Msr;
+
+	use crate::arch::kernel::processor;
+	use crate::arch::x86_64::mm::paging::virtual_to_physical;
+
+	const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
+	const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+	/// Bit 0 of the `MSR_KVM_SYSTEM_TIME_NEW` payload enables the clock.
+	const MSR_KVM_SYSTEM_TIME_ENABLE: u64 = 1;
+
+	// KVM paravirt CPUID: leaf 0x40000000 carries the "KVMKVMKVM" signature;
+	// leaf 0x40000001 EAX bit 3 is KVM_FEATURE_CLOCKSOURCE2, which gates the
+	// `_NEW` clock MSRs. We check these before touching the MSRs so a `wrmsr`
+	// to an unimplemented MSR can't #GP on a non-KVM hypervisor.
+	const KVM_CPUID_SIGNATURE: u32 = 0x4000_0000;
+	const KVM_CPUID_FEATURES: u32 = 0x4000_0001;
+	const KVM_FEATURE_CLOCKSOURCE2: u32 = 1 << 3;
+
+	/// Set by the host while the KVM masterclock keeps every vCPU's pvclock
+	/// parameters consistent. Only then is it valid to read the boot
+	/// processor's time-info page from any CPU; KVM rewrites the page with the
+	/// flag cleared if that ever stops holding, so it is checked on every read.
+	const PVCLOCK_TSC_STABLE_BIT: u8 = 1 << 0;
+
+	/// Re-derive the wall-clock epoch at most this often. This bounds how long
+	/// wall time stays stale after a host-side clock change -- most importantly
+	/// the pause duration of a snapshot/restore, which is invisible to the
+	/// (deliberately continuous) monotonic clock. One `wrmsr` per second of
+	/// wall-clock reads is negligible.
+	const EPOCH_REFRESH_INTERVAL_MICROS: u64 = 1_000_000;
+
+	/// `struct pvclock_wall_clock` (KVM ABI): a seqlock-guarded epoch. The host
+	/// bumps `version` to an odd value while updating, then to an even value
+	/// when the `sec`/`nsec` fields are stable.
+	///
+	/// `align(16)` keeps the 12-byte struct inside a single page, as the ABI
+	/// requires.
+	#[repr(C, align(16))]
+	struct PvclockWallClock {
+		version: AtomicU32,
+		sec: AtomicU32,
+		nsec: AtomicU32,
+	}
+
+	/// `struct pvclock_vcpu_time_info` (KVM ABI): seqlock-guarded TSC scaling
+	/// parameters. `system_time` is the guest time in nanoseconds at the
+	/// instant the TSC read `tsc_timestamp`; scaling the TSC delta by
+	/// `tsc_to_system_mul`/`tsc_shift` extrapolates to "now".
+	///
+	/// `align(64)` keeps the 32-byte struct inside a single page.
+	#[repr(C, align(64))]
+	struct PvclockVcpuTimeInfo {
+		version: AtomicU32,
+		pad0: u32,
+		tsc_timestamp: AtomicU64,
+		system_time: AtomicU64,
+		tsc_to_system_mul: AtomicU32,
+		tsc_shift: AtomicI8,
+		flags: AtomicU8,
+		pad: [u8; 2],
+	}
+
+	// Lives in identity-or-known-mapped kernel memory; we translate its virtual
+	// address to physical for the MSR. Written by the host, read here -- a
+	// single global structure by ABI (the wall-clock MSR is VM-global).
+	static WALL_CLOCK: PvclockWallClock = PvclockWallClock {
+		version: AtomicU32::new(0),
+		sec: AtomicU32::new(0),
+		nsec: AtomicU32::new(0),
+	};
+
+	// Registered with the host on the boot processor only; reads from other
+	// CPUs are gated on `PVCLOCK_TSC_STABLE_BIT` (see above).
+	static VCPU_TIME: PvclockVcpuTimeInfo = PvclockVcpuTimeInfo {
+		version: AtomicU32::new(0),
+		pad0: 0,
+		tsc_timestamp: AtomicU64::new(0),
+		system_time: AtomicU64::new(0),
+		tsc_to_system_mul: AtomicU32::new(0),
+		tsc_shift: AtomicI8::new(0),
+		flags: AtomicU8::new(0),
+		pad: [0; 2],
+	};
+
+	/// Wall-clock microseconds at kvmclock's zero point (the boot instant);
+	/// 0 = not yet derived.
+	static EPOCH_MICROS: AtomicU64 = AtomicU64::new(0);
+	/// kvmclock reading (microseconds) when the epoch was last derived.
+	static EPOCH_READ_AT: AtomicU64 = AtomicU64::new(0);
+	static EPOCH_REFRESHING: AtomicBool = AtomicBool::new(false);
+
+	/// Whether the hypervisor is KVM and advertises the paravirt clock.
+	fn available() -> bool {
+		let sig = core::arch::x86_64::__cpuid(KVM_CPUID_SIGNATURE);
+		// "KVMKVMKVM" in EBX/ECX/EDX as little-endian words:
+		// EBX="KVMK", ECX="VMKV", EDX="M\0\0\0".
+		let is_kvm = sig.ebx == 0x4b4d_564b && sig.ecx == 0x564b_4d56 && sig.edx == 0x0000_004d;
+		if !is_kvm {
+			return false;
+		}
+		let feat = core::arch::x86_64::__cpuid(KVM_CPUID_FEATURES);
+		feat.eax & KVM_FEATURE_CLOCKSOURCE2 != 0
+	}
+
+	fn phys_of<T>(p: *const T) -> Option<u64> {
+		let virt = VirtAddr::new(p.expose_provenance() as u64);
+		virtual_to_physical(virt).map(|pa| pa.as_u64())
+	}
+
+	/// (Re-)derive the wall-clock epoch: the wall time (microseconds since the
+	/// UNIX epoch) at kvmclock's zero point. KVM computes it freshly on every
+	/// MSR write, so after a snapshot/restore or a host NTP step the returned
+	/// epoch shifts to compensate.
+	fn read_wall_clock_epoch() -> Option<u64> {
+		let phys = phys_of(&raw const WALL_CLOCK)?;
+		// SAFETY: CLOCKSOURCE2 is advertised, so this MSR is implemented; `phys`
+		// points at our static, which the host may write.
+		unsafe { Msr::new(MSR_KVM_WALL_CLOCK_NEW).write(phys) };
+
+		for _ in 0..1000 {
+			let v1 = WALL_CLOCK.version.load(Ordering::Acquire);
+			if v1 & 1 != 0 {
+				core::hint::spin_loop();
+				continue;
+			}
+			// The acquire load of `version` orders the data loads after it.
+			let sec = WALL_CLOCK.sec.load(Ordering::Relaxed);
+			let nsec = WALL_CLOCK.nsec.load(Ordering::Relaxed);
+			fence(Ordering::Acquire);
+			let v2 = WALL_CLOCK.version.load(Ordering::Acquire);
+			if v1 == v2 {
+				if sec == 0 && nsec == 0 {
+					return None;
+				}
+				// Microsecond resolution; sub-microsecond precision is dropped.
+				return Some(u64::from(sec) * 1_000_000 + u64::from(nsec) / 1000);
+			}
+		}
+		None
+	}
+
+	/// Guest monotonic time from the pvclock page, in microseconds, or `None`
+	/// if the page is unregistered, not yet filled by the host, or the
+	/// masterclock guarantee is off (in which case the caller falls back to the
+	/// tick-based clock).
+	fn system_time_micros() -> Option<u64> {
+		for _ in 0..1000 {
+			let v1 = VCPU_TIME.version.load(Ordering::Acquire);
+			if v1 == 0 {
+				// The host never filled the page: the MSR was not (successfully)
+				// written, or the host ignored it.
+				return None;
+			}
+			if v1 & 1 != 0 {
+				core::hint::spin_loop();
+				continue;
+			}
+			// The acquire load of `version` orders the data loads after it.
+			let tsc_timestamp = VCPU_TIME.tsc_timestamp.load(Ordering::Relaxed);
+			let system_time = VCPU_TIME.system_time.load(Ordering::Relaxed);
+			let mul = VCPU_TIME.tsc_to_system_mul.load(Ordering::Relaxed);
+			let shift = VCPU_TIME.tsc_shift.load(Ordering::Relaxed);
+			let flags = VCPU_TIME.flags.load(Ordering::Relaxed);
+			// The TSC must be sampled while the parameters are known-stable,
+			// i.e. between the two version reads. `get_timestamp` is
+			// lfence-serialized.
+			let tsc = processor::get_timestamp();
+			fence(Ordering::Acquire);
+			let v2 = VCPU_TIME.version.load(Ordering::Acquire);
+			if v1 != v2 {
+				continue;
+			}
+			if flags & PVCLOCK_TSC_STABLE_BIT == 0 {
+				return None;
+			}
+			// nanos = system_time + (((tsc - tsc_timestamp) << shift) * mul) >> 32
+			// (u128 intermediates: a years-scale TSC delta times a ~2^30 `mul`
+			// overflows u64).
+			let delta = u128::from(tsc.saturating_sub(tsc_timestamp));
+			let delta = if shift >= 0 {
+				delta << u32::try_from(shift).unwrap()
+			} else {
+				delta >> u32::try_from(-i32::from(shift)).unwrap()
+			};
+			let nanos = system_time.wrapping_add(((delta * u128::from(mul)) >> 32) as u64);
+			return Some(nanos / 1000);
+		}
+		None
+	}
+
+	/// Refresh the epoch if it is older than `EPOCH_REFRESH_INTERVAL_MICROS`.
+	/// Serialized by a try-lock; a loser simply uses the current (still
+	/// bounded-stale) epoch for this read.
+	fn maybe_refresh_epoch(mono_micros: u64) {
+		if mono_micros.saturating_sub(EPOCH_READ_AT.load(Ordering::Relaxed))
+			< EPOCH_REFRESH_INTERVAL_MICROS
+		{
+			return;
+		}
+		if EPOCH_REFRESHING
+			.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+			.is_err()
+		{
+			return;
+		}
+		if let Some(epoch) = read_wall_clock_epoch() {
+			// `fetch_max`: never step the derived wall clock backwards. Forward
+			// jumps (snapshot restore) pass through; small backward host
+			// adjustments are absorbed. This keeps `now_micros` non-decreasing
+			// -- callers compute `now - start` durations that must not
+			// underflow.
+			EPOCH_MICROS.fetch_max(epoch, Ordering::AcqRel);
+		}
+		EPOCH_READ_AT.store(mono_micros, Ordering::Relaxed);
+		EPOCH_REFRESHING.store(false, Ordering::Release);
+	}
+
+	/// Current wall time in microseconds since the UNIX epoch, or `None` if
+	/// kvmclock is not (fully) available.
+	pub fn now_micros() -> Option<u64> {
+		let mono = system_time_micros()?;
+		if EPOCH_MICROS.load(Ordering::Relaxed) == 0 {
+			return None;
+		}
+		maybe_refresh_epoch(mono);
+		Some(EPOCH_MICROS.load(Ordering::Relaxed) + mono)
+	}
+
+	/// One-time initialization on the boot processor (pre-SMP): registers the
+	/// system-time page and derives the boot epoch. Returns the boot instant in
+	/// microseconds since the UNIX epoch, or `None` if kvmclock is unavailable.
+	pub fn init() -> Option<u64> {
+		if !available() {
+			return None;
+		}
+		if let Some(phys) = phys_of(&raw const VCPU_TIME) {
+			// SAFETY: CLOCKSOURCE2 is advertised, so this MSR is implemented;
+			// `phys` points at our static, which the host writes from now on.
+			unsafe { Msr::new(MSR_KVM_SYSTEM_TIME_NEW).write(phys | MSR_KVM_SYSTEM_TIME_ENABLE) };
+		}
+		let epoch = read_wall_clock_epoch()?;
+		EPOCH_MICROS.store(epoch, Ordering::Relaxed);
+		EPOCH_READ_AT.store(system_time_micros().unwrap_or(0), Ordering::Relaxed);
+		Some(epoch)
+	}
+}
+
 fn boot_time() -> OffsetDateTime {
 	#[cfg(feature = "uhyve")]
 	if let Some(boot_time) = crate::env::uhyve_boot_time() {
+		return boot_time;
+	}
+
+	// Firecracker and other RTC-less hypervisors: kvmclock carries the real
+	// wall clock. The epoch it reports is the wall time at kvmclock/TSC zero,
+	// i.e. the boot instant itself -- no ticks subtraction. A host-provided
+	// out-of-range value falls through to the RTC path instead of panicking.
+	#[cfg(feature = "kvmclock")]
+	if let Some(epoch_micros) = kvmclock::init()
+		&& let Ok(boot_time) =
+			OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_micros) * 1000)
+	{
 		return boot_time;
 	}
 
@@ -197,5 +483,13 @@ pub fn init() {
 
 /// Returns the current time in microseconds since UNIX epoch.
 pub fn now_micros() -> u64 {
+	// Prefer kvmclock: host-provided TSC scaling (no whole-MHz calibration
+	// drift) and a periodically re-derived wall epoch (converges to real time
+	// after a snapshot/restore instead of staying behind by the pause
+	// duration).
+	#[cfg(feature = "kvmclock")]
+	if let Some(now) = kvmclock::now_micros() {
+		return now;
+	}
 	*BOOT_TIME.get().unwrap() + processor::get_timer_ticks()
 }
