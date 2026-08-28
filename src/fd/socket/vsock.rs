@@ -448,10 +448,10 @@ impl ObjectInterface for Socket {
 						const HEADER_SIZE: usize = size_of::<Hdr>();
 						let mut driver_guard = hardware::get_vsock_driver().unwrap().lock();
 						let local_cid = driver_guard.get_cid();
-						let len = core::cmp::min(
-							buf.len(),
-							usize::try_from(raw.peer_buf_alloc - diff).unwrap(),
-						);
+						let len = buf
+							.len()
+							.min(usize::try_from(raw.peer_buf_alloc - diff).unwrap())
+							.min(usize::try_from(crate::config::VSOCK_PACKET_SIZE).unwrap());
 
 						driver_guard.send_packet(HEADER_SIZE + len, |virtio_buffer| {
 							let response =

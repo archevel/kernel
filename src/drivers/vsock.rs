@@ -173,7 +173,8 @@ impl TxQueue {
 		self.poll();
 		let vq = self.vq.as_mut().expect("Unable to get send queue");
 
-		assert!(len < usize::try_from(self.packet_length).unwrap());
+		// `packet_length` counts header + max payload; a full packet is legal.
+		assert!(len <= usize::try_from(self.packet_length).unwrap());
 		let mut packet = Vec::with_capacity_in(len, DeviceAlloc);
 		let result = unsafe {
 			let result = f(packet.spare_capacity_mut().assume_init_mut());
