@@ -16,6 +16,7 @@ use memory_addresses::{PhysAddr, VirtAddr};
 #[cfg(target_arch = "x86_64")]
 use crate::arch::mm::paging::PageTableEntryFlagsExt;
 use crate::arch::mm::paging::{self, BasePageSize, PageSize, PageTableEntryFlags};
+use crate::errno::Errno;
 use crate::mm::{FrameAlloc, PageAlloc, PageRangeAllocator};
 
 bitflags! {
@@ -33,7 +34,26 @@ bitflags! {
 	}
 }
 
-static PROT_NONE_FREE_LIST: SpinMutex<FreeList<16>> = SpinMutex::new(FreeList::new());
+/// Virtual address ranges handed out by [`sys_mmap`] and not yet returned via
+/// [`sys_munmap`].
+///
+/// [`sys_munmap`] only accepts ranges that are recorded here, so stray or
+/// repeated unmaps cannot corrupt [`PageAlloc`] or unmap kernel mappings.
+/// Adjacent ranges coalesce, so one `munmap` may span several `mmap`s, and a
+/// `munmap` of a sub-range splits the recorded range accordingly.
+static MMAP_RANGES: SpinMutex<FreeList<16>> = SpinMutex::new(FreeList::new());
+
+fn page_table_flags(prot_flags: MemoryProtection) -> PageTableEntryFlags {
+	let mut flags = PageTableEntryFlags::empty();
+	flags.normal();
+	if prot_flags.contains(MemoryProtection::Write) {
+		flags.writable();
+	}
+	if !prot_flags.contains(MemoryProtection::Exec) {
+		flags.execute_disable();
+	}
+	flags
+}
 
 /// Creates a new virtual memory mapping of the `size` specified with
 /// protection bits specified in `prot_flags`.
@@ -41,32 +61,40 @@ static PROT_NONE_FREE_LIST: SpinMutex<FreeList<16>> = SpinMutex::new(FreeList::n
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_mmap(size: usize, prot_flags: MemoryProtection, ret: &mut *mut u8) -> i32 {
 	let size = size.align_up(BasePageSize::SIZE as usize);
+	if size == 0 {
+		return -i32::from(Errno::Inval);
+	}
 	let layout = PageLayout::from_size(size).unwrap();
-	let page_range = PageAlloc::allocate(layout).unwrap();
+	let Ok(page_range) = PageAlloc::allocate(layout) else {
+		return -i32::from(Errno::Nomem);
+	};
 	let virtual_address = VirtAddr::from(page_range.start());
-	if prot_flags.is_empty() {
-		*ret = virtual_address.as_mut_ptr();
-		unsafe {
-			PROT_NONE_FREE_LIST.lock().deallocate(page_range).unwrap();
-		}
-		return 0;
-	}
-	let frame_layout = PageLayout::from_size(size).unwrap();
-	let frame_range = FrameAlloc::allocate(frame_layout).unwrap();
-	let physical_address = PhysAddr::from(frame_range.start());
 
-	debug!("Mmap {physical_address:X} -> {virtual_address:X} ({size})");
-	let count = size / BasePageSize::SIZE as usize;
-	let mut flags = PageTableEntryFlags::empty();
-	flags.normal().writable();
-	if prot_flags.contains(MemoryProtection::Write) {
-		flags.writable();
-	}
-	if !prot_flags.contains(MemoryProtection::Exec) {
-		flags.execute_disable();
+	// `MemoryProtection::None` reserves address space only: no frames are
+	// allocated and no pages are mapped.
+	if !prot_flags.is_empty() {
+		let frame_layout = PageLayout::from_size(size).unwrap();
+		let Ok(frame_range) = FrameAlloc::allocate(frame_layout) else {
+			unsafe {
+				PageAlloc::deallocate(page_range);
+			}
+			return -i32::from(Errno::Nomem);
+		};
+		let physical_address = PhysAddr::from(frame_range.start());
+
+		debug!("Mmap {physical_address:X} -> {virtual_address:X} ({size})");
+		let count = size / BasePageSize::SIZE as usize;
+		paging::map::<BasePageSize>(
+			virtual_address,
+			physical_address,
+			count,
+			page_table_flags(prot_flags),
+		);
 	}
 
-	paging::map::<BasePageSize>(virtual_address, physical_address, count, flags);
+	unsafe {
+		MMAP_RANGES.lock().deallocate(page_range).unwrap();
+	}
 
 	*ret = virtual_address.as_mut_ptr();
 
@@ -78,21 +106,38 @@ pub extern "C" fn sys_mmap(size: usize, prot_flags: MemoryProtection, ret: &mut 
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_munmap(ptr: *mut u8, size: usize) -> i32 {
 	let virtual_address = VirtAddr::from_ptr(ptr);
+	if !virtual_address.is_aligned_to(BasePageSize::SIZE) {
+		return -i32::from(Errno::Inval);
+	}
 	let size = size.align_up(BasePageSize::SIZE as usize);
+	if size == 0 {
+		return -i32::from(Errno::Inval);
+	}
 	let page_range = PageRange::from_start_len(virtual_address.as_usize(), size).unwrap();
 
-	if PROT_NONE_FREE_LIST.lock().allocate_at(page_range).is_ok() {
-		return 0;
+	// Claim the range from the bookkeeping of live mappings. Failure means
+	// (part of) the range was not obtained from `sys_mmap`, so unmapping it
+	// could free frames or address space owned by someone else.
+	if MMAP_RANGES.lock().allocate_at(page_range).is_err() {
+		return -i32::from(Errno::Inval);
 	}
 
-	if let Some(physical_address) = paging::virtual_to_physical(virtual_address) {
-		paging::unmap::<BasePageSize>(virtual_address, size / BasePageSize::SIZE as usize);
-		debug!("Unmapping {virtual_address:X} ({size}) -> {physical_address:X}");
+	debug!("Munmap {virtual_address:X} ({size})");
 
-		let frame_range =
-			PageRange::from_start_len(physical_address.as_u64() as usize, size).unwrap();
-		unsafe {
-			FrameAlloc::deallocate(frame_range);
+	// Unmap and free page by page: the range may be backed by multiple
+	// physically discontiguous frame allocations (e.g. committed piecewise
+	// via `sys_mprotect`), and pages of a `MemoryProtection::None` reservation
+	// have no frames at all.
+	for offset in (0..size).step_by(BasePageSize::SIZE as usize) {
+		let page_address = virtual_address + offset as u64;
+		if let Some(physical_address) = paging::virtual_to_physical(page_address) {
+			paging::unmap::<BasePageSize>(page_address, 1);
+			let frame_range =
+				PageRange::from_start_len(physical_address.as_usize(), BasePageSize::SIZE as usize)
+					.unwrap();
+			unsafe {
+				FrameAlloc::deallocate(frame_range);
+			}
 		}
 	}
 
@@ -111,14 +156,7 @@ pub extern "C" fn sys_munmap(ptr: *mut u8, size: usize) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_mprotect(ptr: *mut u8, size: usize, prot_flags: MemoryProtection) -> i32 {
 	let count = size / BasePageSize::SIZE as usize;
-	let mut flags = PageTableEntryFlags::empty();
-	flags.normal().writable();
-	if prot_flags.contains(MemoryProtection::Write) {
-		flags.writable();
-	}
-	if !prot_flags.contains(MemoryProtection::Exec) {
-		flags.execute_disable();
-	}
+	let flags = page_table_flags(prot_flags);
 
 	let virtual_address = VirtAddr::from_ptr(ptr);
 
