@@ -22,6 +22,18 @@ pub unsafe fn set_start_info(raw_boot_info: RawBootInfo) {
 	START_INFO.set(start_info).unwrap();
 }
 
+/// End of the LOADED kernel image as reported by the loader.
+///
+/// This can exceed the linker-provided `_end`: the loader maps every
+/// `PT_LOAD` segment, including segments appended to the ELF *after*
+/// linking (e.g. a bundled application artifact), which `_end` knows
+/// nothing about. Memory management must treat everything up to this
+/// address as occupied, not just up to `_end`.
+pub fn loaded_image_end() -> Option<usize> {
+	let info = START_INFO.get()?;
+	Some(info.load_info.kernel_image_addr_range.end as usize)
+}
+
 /// Physical address of the Linux boot params ("zero page"), if the kernel was
 /// booted via the Linux boot protocol.
 #[cfg(target_arch = "x86_64")]

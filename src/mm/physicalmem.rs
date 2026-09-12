@@ -109,6 +109,18 @@ pub unsafe fn map_frame_range(frame_range: PageRange) {
 	}
 }
 
+/// End of the kernel image in memory: the linker's `_end`, or the
+/// loader-reported extent when that is larger (the loader maps every
+/// PT_LOAD, including segments appended to the ELF post-link, which the
+/// linker never saw).
+fn kernel_image_end() -> usize {
+	let linked_end = elf_symbols::executable_end().addr();
+	match env::loaded_image_end() {
+		Some(loaded_end) => linked_end.max(loaded_end),
+		None => linked_end,
+	}
+}
+
 unsafe fn detect_from_start_info() {
 	// On x86_64 with Linux boot params, build a list of non-RAM regions from
 	// the E820 table so we can skip them when claiming memory-map entries.
@@ -183,7 +195,11 @@ unsafe fn detect_from_start_info() {
 		// running page tables out as allocations, which ends in a triple
 		// fault. This also covers the recursive-page-table case of loader
 		// 0.5.6 that was previously special-cased via `paging::is_recursive`.
-		start_addr = start_addr.max(elf_symbols::executable_end().addr());
+		//
+		// The image can end ABOVE the linker's `_end`: the loader maps every
+		// PT_LOAD, including segments appended post-link (bundled artifacts),
+		// and reports the true extent in its boot info. Respect both.
+		start_addr = start_addr.max(kernel_image_end());
 
 		start_addr = start_addr.align_up(0x1000);
 		end_addr = end_addr.align_down(0x1000);
@@ -211,7 +227,7 @@ unsafe fn detect_from_start_info() {
 	};
 
 	let kernel_start = elf_symbols::executable_start().addr();
-	let kernel_end = elf_symbols::executable_end().addr();
+	let kernel_end = kernel_image_end();
 	let kernel_region = PageRange::containing(kernel_start, kernel_end).unwrap();
 	reserve(kernel_region);
 

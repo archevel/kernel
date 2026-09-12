@@ -2,6 +2,11 @@ use core::num::NonZero;
 
 use super::StartInfo;
 
+/// No loader-reported image extent without hermit-entry boot info.
+pub fn loaded_image_end() -> Option<usize> {
+	None
+}
+
 #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
 pub fn start_info() -> &'static impl StartInfo {
 	#[expect(unreachable_code)]
