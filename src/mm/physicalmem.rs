@@ -173,14 +173,17 @@ unsafe fn detect_from_start_info() {
 		// likely be lowered.
 		start_addr = start_addr.max(LargePageSize::SIZE as usize);
 
-		#[cfg(all(target_arch = "x86_64", feature = "hermit-entry"))]
-		if paging::is_recursive() {
-			start_addr = start_addr.max(elf_symbols::executable_end().addr());
-		}
-
-		if cfg!(target_arch = "aarch64") || cfg!(target_arch = "riscv64") {
-			start_addr = start_addr.max(elf_symbols::executable_end().addr());
-		}
+		// Do not claim any memory below the kernel image.
+		//
+		// The loader may place its own image, the kernel's boot stack, and the
+		// page tables the kernel is running on anywhere below the kernel image
+		// without announcing them as FDT memory reservations. hermit-loader
+		// 0.5.6's x86_64 Linux-boot image is linked at 0x200000 and contains
+		// the live root page table; claiming that region eventually hands the
+		// running page tables out as allocations, which ends in a triple
+		// fault. This also covers the recursive-page-table case of loader
+		// 0.5.6 that was previously special-cased via `paging::is_recursive`.
+		start_addr = start_addr.max(elf_symbols::executable_end().addr());
 
 		start_addr = start_addr.align_up(0x1000);
 		end_addr = end_addr.align_down(0x1000);
